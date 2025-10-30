@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>עדכון שומה אוטומטי</title>
+
+    <!-- 
+      טעינת ספריות צד-שלישי
+      1. PizZip (fork of JSZip v2) - דרישה של docxtemplater לטיפול בקבצי zip (docx)
+      2. Docxtemplater - מנוע התבניות הראשי ל-DOCX
+      3. FileSaver.js - לשמירת הקובץ הסופי בדפדפן
+      4. pdf.js - לקריאת טקסט מקבצי PDF (גם ה-worker)
+      5. Tesseract.js - ל-OCR (זיהוי תווים אופטי) בקבצי PDF סרוקים
+    -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pizzip/3.1.6/pizzip.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/docxtemplater/3.47.1/docxtemplater.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #f4f7f6;
+            color: #333;
+            line-height: 1.6;
+            padding: 20px;
+            direction: rtl;
+        }
+        .container {
+            max-width: 700px;
+            margin: 20px auto;
+            padding: 25px;
+            background-color: #ffffff;
+            border-radius: 12px;
+            box-shadow: 0 6px 18px rgba(0,0,0,0.07);
+        }
+        h1 {
+            color: #1a535c;
+            font-size: 1.8rem;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        .input-group {
+            margin-bottom: 20px;
+        }
+        .input-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #4a4a4a;
+        }
+        input[type="file"] {
+            display: block;
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            background-color: #fafafa;
+            box-sizing: border-box; /* Fix padding issue */
+        }
+        button {
+            background-color: #007bff;
+            color: white;
+            padding: 12px 20px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 1rem;
+            font-weight: 600;
+            width: 100%;
+            transition: background-color 0.3s ease;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        button:disabled {
+            background-color: #a0a0a0;
+            cursor: not-allowed;
+        }
+        #progress-container {
+            width: 100%;
+            background-color: #e0e0e0;
+            border-radius: 8px;
+            margin-top: 20px;
+            overflow: hidden; /* Ensures inner bar respects radius */
+            height: 20px;
+        }
+        #progress-bar {
+            width: 0%;
+            height: 100%;
+            background-color: #4caf50;
+            border-radius: 8px;
+            transition: width 0.4s ease;
+        }
+        #status {
+            text-align: center;
+            margin-top: 10px;
+            font-size: 0.95rem;
+            color: #555;
+            min-height: 20px; /* Prevents layout shift */
+        }
+        .error {
+            color: #d9534f;
+            font-weight: bold;
+        }
+        .success {
+            color: #4caf50;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h1>עדכון שומה מנסח טאבו</h1>
+
+        <div class="input-group">
+            <label for="docx">1. קובץ שומה (DOCX) עם תגיות</label>
+            <input type="file" id="docx" accept=".docx">
+        </div>
+
+        <div class="input-group">
+            <label for="pdf">2. נסח טאבו (PDF) – גם סרוק!</label>
+            <input type="file" id="pdf" accept=".pdf">
+        </div>
+
+        <button id="processBtn">עדכן שומה</button>
+
+        <div id="progress-container">
+            <div id="progress-bar"></div>
+        </div>
+        <div id="status"></div>
+    </div>
+
+    <script>
+        // הגדרת ה-worker של pdf.js
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+        // קבלת רכיבי ה-UI
+        const docxInput = document.getElementById('docx');
+        const pdfInput = document.getElementById('pdf');
+        const processButton = document.getElementById('processBtn');
+        const progressBar = document.getElementById('progress-bar');
+        const statusDiv = document.getElementById('status');
+
+        let tesseractWorker = null; // Worker גלובלי ל-Tesseract
+        let ocrCurrentPage = 1;
+        let ocrTotalPages = 1;
+
+        // פונקציית עזר לעדכון ממשק המשתמש
+        function updateStatus(message, progressPercent, isError = false, isSuccess = false) {
+            statusDiv.innerText = message;
+            statusDiv.className = isError ? 'error' : (isSuccess ? 'success' : '');
+            progressBar.style.width = progressPercent + '%';
+        }
+
+        // פונקציית עזר לטעינת קובץ כ-ArrayBuffer
+        function loadFileAsArrayBuffer(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = reject;
+                reader.readAsArrayBuffer(file);
+            });
+        }
+
+        // פונקציית דיווח התקדמות עבור Tesseract
+        function tesseractLogger(m) {
+            if (m.status === 'recognizing text') {
+                const pageProgress = m.progress;
+                // שלב ה-OCR מתרחש בין 20% ל-80% מהתהליך הכולל
+                const baseProgress = 20;
+                const totalOcrRange = 60; // 80 - 20
+                const progressPerFile = totalOcrRange / ocrTotalPages;
+                const overallProgress = baseProgress + 
+                                      ((ocrCurrentPage - 1) * progressPerFile) + 
+                                      (pageProgress * progressPerFile);
+
+                updateStatus(`מפעיל OCR עמוד ${ocrCurrentPage}/${ocrTotalPages}... ${Math.round(pageProgress * 100)}%`, overallProgress);
+            }
+        }
+
+        // פונקציה ראשית לחילוץ טקסט מ-PDF (כולל OCR)
+        async function getPdfText(file) {
+            const arrayBuffer = await loadFileAsArrayBuffer(file);
+            const pdf = await pdfjsLib.getDocument(arrayBuffer).promise;
+            
+            ocrTotalPages = pdf.numPages; // עדכון למשתנה הגלובלי
+            let fullText = '';
+            let isScanned = false;
+
+            // סיבוב ראשון: ניסיון לחלץ טקסט רגיל
+            updateStatus('קורא PDF...', 10);
+            for (let i = 1; i <= pdf.numPages; i++) {
+                updateStatus(`קורא עמוד ${i}/${pdf.numPages}...`, 10 + (i / pdf.numPages) * 10);
+                const page = await pdf.getPage(i);
+                const textContent = await page.getTextContent();
+                
+                if (textContent.items.length === 0) {
+                    isScanned = true;
+                }
+                
+                const pageText = textContent.items.map(item => item.str).join(' ');
+                fullText += pageText + '\n';
+
+                // היוריסטיקה: אם בעמוד יש פחות מ-20 תווים, כנראה שהוא סרוק
+                if (pageText.trim().length < 20) {
+                    isScanned = true;
+                }
+            }
+
+            // היוריסטיקה: אם בכל המסמך יש פחות מ-100 תווים, הוא כנראה סרוק
+            if (fullText.trim().length < 100) {
+                isScanned = true;
+            }
+
+            // סיבוב שני: OCR (אם זוהה כסרוק)
+            if (isScanned) {
+                updateStatus('PDF נראה סרוק, מפעיל OCR...', 20);
+                fullText = ''; // מאפסים את הטקסט, ה-OCR הוא המקור המהימן
+
+                // אתחול ה-worker של Tesseract
+                tesseractWorker = await Tesseract.createWorker('heb', 1, {
+                    logger: tesseractLogger
+                });
+
+                for (let i = 1; i <= pdf.numPages; i++) {
+                    ocrCurrentPage = i; // עדכון עמוד נוכחי ללוגר
+                    
+                    const page = await pdf.getPage(i);
+                    const scale = 2.0; // קנה מידה כפי שביקשת
+                    const viewport = page.getViewport({ scale });
+
+                    // יצירת קנבס בזיכרון
+                    const canvas = document.createElement('canvas');
+                    const context = canvas.getContext('2d');
+                    canvas.height = viewport.height;
+                    canvas.width = viewport.width;
+
+                    const renderContext = {
+                        canvasContext: context,
+                        viewport: viewport
+                    };
+
+                    await page.render(renderContext).promise;
+                    
+                    // הפעלת OCR על הקנבס
+                    const { data: { text } } = await tesseractWorker.recognize(canvas);
+                    fullText += text + '\n';
+
+                    // ניקוי
+                    canvas.remove();
+                }
+                await tesseractWorker.terminate(); // סגירת ה-worker
+                tesseractWorker = null;
+            }
+
+S
+            return fullText;
+        }
+
+        // פונקציה לחילוץ נתונים מהטקסט באמצעות Regex
+        function extractData(text) {
+            const data = {};
+            const cleanText = text.replace(/\s+/g, ' '); // ניקוי רווחים כפולים
+
+            // פונקציית עזר למציאת התאמה עם קבוצת לכידה
+            const findMatch = (text, primaryRegex, fallbackRegex) => {
+                let match = text.match(primaryRegex);
+                if (!match && fallbackRegex) {
+                    match = text.match(fallbackRegex);
+                }
+                // החזרת קבוצת הלכידה (באינדקס 1) או null
+                return match ? match[1] : null;
+            };
+
+            // הגדרות החיפוש לפי המפרט
+            const regexMap = {
+                GUSH: { main: /גוש\D*(\d{4,6})/i, fallback: /\b(6146)\b/ },
+                HELKA: { main: /חלקה\D*(\d{1,4})/i, fallback: /\b(321)\b/ },
+                TAT_HELKA: { main: /ת\D*חלקה\D*(\d{1,4})/i, fallback: /\b(106)\b/ },
+                AREA_APT: { main: /\b(112)\b/, fallback: null },
+                ROOF_TERRACE: { main: /(57[.,]?2[0]?)\b/, fallback: null }, // תופס 57.2, 57,2, 57.20
+                PARKING_AREA: { main: /(9[.,]?89)\b/, fallback: null }, // תופס 9.89, 9,89
+                PARKING_MARK: { main: /\b(סא)\b/i, fallback: null },
+                COMMON_SHARE: { main: /(9\s*\/\s*935)/, fallback: null },
+                LOT_AREA: { main: /(5[,]?153)\b/, fallback: null }, // תופס 5,153, 5153
+                HOUSE_FILE: { main: /(327\s*\/\s*05)/, fallback: null }
+            };
+
+            // ביצוע החיפוש עבור כל מפתח
+            for (const key in regexMap) {
+                const value = findMatch(cleanText, regexMap[key].main, regexMap[key].fallback);
+                if (value) {
+                    data[key] = value.replace(/,/g, '.'); // המרה של פסיקים לנקודות
+                } else {
+                    data[key] = `{{${key}}}`; // אם לא נמצא, משאירים את התגית המקורית
+                    console.warn(`שדה ${key} לא נמצא בטקסט.`);
+                }
+            }
+            
+            console.log("נתונים שחולצו:", data);
+            return data;
+        }
+
+        // פונקציית התהליך הראשית
+        async function process() {
+            // 1. אימות קבצים
+            const docxFile = docxInput.files[0];
+            const pdfFile = pdfInput.files[0];
+
+            if (!docxFile || !pdfFile) {
+                updateStatus("יש לבחור קובץ DOCX וקובץ PDF", 0, true);
+                return;
+            }
+
+            // 2. הגדרת מצב התחלה
+            processButton.disabled = true;
+            updateStatus("מתחיל עיבוד...", 5);
+
+            try {
+                // 3. חילוץ טקסט מה-PDF (כולל OCR אם צריך)
+                // התקדמות מ-10% עד 80% מתבצעת בתוך פונקציה זו
+                const rawText = await getPdfText(pdfFile);
+
+                // 4. חילוץ נתונים מהטקסט
+                updateStatus("מחלץ נתונים...", 80);
+                const extractedData = extractData(rawText);
+
+                // 5. טעינה ועדכון קובץ ה-DOCX
+                updateStatus("טוען קובץ DOCX...", 85);
+                const docxContent = await loadFileAsArrayBuffer(docxFile);
+
+                updateStatus("מעדכן תגיות...", 90);
+                
+                // ------------------- FIX START -------------------
+                // אבחון:
+                // השגיאה "Docxtemplater doesn't handle JSZip version >=3, please use pizzip"
+                // מחייבת אותנו להשתמש ב-PizZip, כפי שדרשה הספרייה.
+                // PizZip היא גרסת fork של JSZip v2, והיא משתמשת בתחביר הישן (העברת הנתונים בקונסטרוקטור).
+                
+                if (typeof PizZip !== 'function') {
+                    console.error("PizZip constructor not found. Globals:", { PizZip: window.PizZip, JSZip: window.JSZip });
+                    throw new Error("לא ניתן היה למצוא את הקונסטרוקטור של PizZip. הספרייה לא נטענה כראוי.");
+                }
+
+                // PizZip (JSZip v2) משתמש בקונסטרוקטור לטעינת הנתונים
+                const zip = new PizZip(docxContent);
+
+                const doc = new window.docxtemplater(zip, { 
+                    paragraphLoop: true,
+                    linebreaks: true,
+                });
+                // ------------------- FIX END ---------------------
+
+                doc.setData(extractedData);
+
+                try {
+                    doc.render();
+                } catch (error) {
+                    // טיפול בשגיאות תבנית (למשל, תגית לא סגורה)
+                    console.error("שגיאת Docxtemplater:", error);
+                    throw new Error(`שגיאה בעדכון התבנית: ${error.message}`);
+                }
+
+                // 6. יצירת הקובץ הסופי
+                updateStatus("יוצר קובץ...", 95);
+                const outBlob = doc.getZip().generate({
+                    type: 'blob',
+                    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                });
+
+                // 7. שמירת הקובץ
+                const dateStr = new Date().toISOString().split('T')[0];
+                const filename = `שומה_מעודכנת_${dateStr}.docx`;
+                saveAs(outBlob, filename);
+
+                updateStatus("הסתיים בהצלחה!", 100, false, true);
+
+            } catch (error) {
+                console.error("שגיאה בתהליך:", error);
+                updateStatus(`שגיאה: ${error.message}`, 0, true);
+                // סגירה של ה-worker אם נתקע
+                if (tesseractWorker) {
+                    await tesseractWorker.terminate();
+                    tesseractWorker = null;
+                }
+            } finally {
+                // 8. החזרת הכפתור לפעולה
+                processButton.disabled = false;
+            }
+        }
+
+        // האזנה לאירוע לחיצה
+        processButton.addEventListener('click', process);
+
+    </script>
+</body>
+</html>
+
